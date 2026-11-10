@@ -6,7 +6,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -14,15 +13,561 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
-      - name: Show files
-        run: find . -not -path './.git/*' | head -60
+      - name: Create project
+        run: |
+          mkdir -p shakti/app
+          cat > shakti/app/build.gradle.kts <<'SHAKTI_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.shakti.assistant"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.shakti.assistant"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          SHAKTI_EOF
+          mkdir -p shakti/app/src/main
+          cat > shakti/app/src/main/AndroidManifest.xml <<'SHAKTI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+              <uses-permission android:name="android.permission.SEND_SMS" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+              <uses-permission android:name="android.permission.SET_ALARM" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+              <queries>
+                  <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent>
+                  <intent><action android:name="android.speech.RecognitionService" /></intent>
+              </queries>
+
+              <application android:label="@string/app_name" android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".ShaktiService" android:exported="false"
+                      android:foregroundServiceType="microphone" />
+                  <service android:name=".ShaktiAccess" android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          SHAKTI_EOF
+          mkdir -p shakti/app/src/main/java/com/shakti/assistant
+          cat > shakti/app/src/main/java/com/shakti/assistant/Actions.kt <<'SHAKTI_EOF'
+          package com.shakti.assistant
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.provider.AlarmClock
+          import android.provider.ContactsContract.CommonDataKinds.Phone
+          import android.telephony.SmsManager
+          import org.json.JSONObject
+
+          object Actions {
+              private const val NOACC = "Accessibility ચાલુ નથી. એપમાં સ્ટેપ 3 કરો."
+
+              private fun go(c: Context, i: Intent) { i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); c.startActivity(i) }
+              private fun view(c: Context, u: String) = go(c, Intent(Intent.ACTION_VIEW, Uri.parse(u)))
+
+              private fun number(c: Context, who: String): String? {
+                  val clean = who.replace(Regex("[\\s-]"), "")
+                  if (clean.matches(Regex("\\+?\\d{5,15}"))) return clean
+                  if (c.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return null
+                  c.contentResolver.query(Phone.CONTENT_URI, arrayOf(Phone.NUMBER),
+                      "${Phone.DISPLAY_NAME} LIKE ?", arrayOf("%$who%"), null)?.use {
+                      if (it.moveToFirst()) return it.getString(0)
+                  }
+                  return null
+              }
+
+              private fun openApp(c: Context, name: String): String {
+                  val pm = c.packageManager
+                  val list = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                  val app = list.firstOrNull { it.loadLabel(pm).toString().equals(name, true) }
+                      ?: list.firstOrNull { it.loadLabel(pm).toString().contains(name, true) }
+                      ?: return "એપ મળી નથી: $name"
+                  val i = pm.getLaunchIntentForPackage(app.activityInfo.packageName) ?: return "ખોલી શકાઈ નહીં"
+                  go(c, i)
+                  return "$name ખોલી"
+              }
+
+              fun run(c: Context, name: String, a: JSONObject): String {
+                  val acc = ShaktiAccess.inst
+                  val out = when (name) {
+                      "open_app" -> openApp(c, a.getString("name"))
+                      "call" -> {
+                          val n = number(c, a.getString("who")) ?: return "નંબર મળ્યો નથી"
+                          go(c, Intent(Intent.ACTION_CALL, Uri.parse("tel:$n"))); "કોલ લગાવ્યો"
+                      }
+                      "send_sms" -> {
+                          val n = number(c, a.getString("who")) ?: return "નંબર મળ્યો નથી"
+                          SmsManager.getDefault().sendTextMessage(n, null, a.getString("text"), null, null); "SMS મોકલ્યો"
+                      }
+                      "whatsapp" -> {
+                          val n = number(c, a.optString("who")) ?: ""
+                          view(c, "https://wa.me/${n.replace("+", "")}?text=" + Uri.encode(a.optString("text")))
+                          "WhatsApp ખુલ્યું. Send દબાવવા click_text વાપરો"
+                      }
+                      "set_alarm" -> {
+                          go(c, Intent(AlarmClock.ACTION_SET_ALARM)
+                              .putExtra(AlarmClock.EXTRA_HOUR, a.getInt("hour"))
+                              .putExtra(AlarmClock.EXTRA_MINUTES, a.optInt("minute", 0))
+                              .putExtra(AlarmClock.EXTRA_MESSAGE, a.optString("label"))
+                              .putExtra(AlarmClock.EXTRA_SKIP_UI, true)); "એલાર્મ સેટ"
+                      }
+                      "set_timer" -> {
+                          go(c, Intent(AlarmClock.ACTION_SET_TIMER)
+                              .putExtra(AlarmClock.EXTRA_LENGTH, a.getInt("seconds"))
+                              .putExtra(AlarmClock.EXTRA_SKIP_UI, true)); "ટાઈમર સેટ"
+                      }
+                      "flashlight" -> {
+                          val cm = c.getSystemService(CameraManager::class.java)
+                          cm.setTorchMode(cm.cameraIdList[0], a.getBoolean("on")); "થઈ ગયું"
+                      }
+                      "volume" -> {
+                          val am = c.getSystemService(AudioManager::class.java)
+                          val d = when (a.getString("direction")) {
+                              "up" -> AudioManager.ADJUST_RAISE
+                              "down" -> AudioManager.ADJUST_LOWER
+                              else -> AudioManager.ADJUST_MUTE
+                          }
+                          am.adjustStreamVolume(AudioManager.STREAM_MUSIC, d, AudioManager.FLAG_SHOW_UI); "વોલ્યુમ બદલ્યું"
+                      }
+                      "navigate" -> { view(c, "google.navigation:q=" + Uri.encode(a.getString("place"))); "નેવિગેશન ચાલુ" }
+                      "search_web" -> { view(c, "https://www.google.com/search?q=" + Uri.encode(a.getString("query"))); "સર્ચ ખુલ્યું" }
+                      "play_youtube" -> { view(c, "https://www.youtube.com/results?search_query=" + Uri.encode(a.getString("query"))); "YouTube ખુલ્યું" }
+                      "read_screen" -> acc?.readScreen() ?: NOACC
+                      "click_text" -> acc?.clickText(a.getString("text")) ?: NOACC
+                      "type_text" -> acc?.typeText(a.getString("text")) ?: NOACC
+                      "system_button" -> acc?.press(a.getString("which")) ?: NOACC
+                      else -> "અજાણ્યું કાર્ય"
+                  }
+                  if (name in setOf("open_app", "call", "whatsapp", "navigate", "search_web", "play_youtube")) Thread.sleep(1800)
+                  return out
+              }
+          }
+          SHAKTI_EOF
+          mkdir -p shakti/app/src/main/java/com/shakti/assistant
+          cat > shakti/app/src/main/java/com/shakti/assistant/Brain.kt <<'SHAKTI_EOF'
+          package com.shakti.assistant
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object Brain {
+              private const val MODEL = "claude-sonnet-5-5"
+              private val history = JSONArray()
+
+              private const val SYSTEM = "તમારું નામ શક્તિ છે, તમે વપરાશકર્તાના Android ફોનનો વોઇસ આસિસ્ટન્ટ છો. " +
+                  "વપરાશકર્તા ગુજરાતીમાં બોલે છે; જવાબ ખૂબ ટૂંકા (1-2 વાક્ય) ગુજરાતીમાં આપો, કારણ કે તે બોલીને સંભળાવાશે. " +
+                  "ફોન પર કામ કરવા ટૂલ્સ વાપરો. એપની અંદરનું કામ કરવા: open_app, પછી read_screen થી જુઓ, પછી click_text/type_text/system_button. " +
+                  "એપના નામ અંગ્રેજીમાં આપો. સંપર્કનું નામ જેમ બોલાયું તેમ (ગુજરાતી/અંગ્રેજી) આપો. " +
+                  "કોલ/SMS/ચુકવણી જેવા કામમાં વિગત અસ્પષ્ટ હોય તો પહેલા પૂછો. પૈસા ટ્રાન્સફર ક્યારેય જાતે કન્ફર્મ ન કરો."
+
+              private fun p(vararg kv: Pair<String, String>) = JSONObject().apply {
+                  kv.forEach { (k, t) -> put(k, JSONObject().put("type", if (t == "bool") "boolean" else if (t == "int") "integer" else "string")) }
+              }
+              private fun tool(n: String, d: String, props: JSONObject = JSONObject(), vararg req: String) =
+                  JSONObject().put("name", n).put("description", d).put("input_schema",
+                      JSONObject().put("type", "object").put("properties", props).put("required", JSONArray(req.toList())))
+
+              private val tools = JSONArray().apply {
+                  put(tool("open_app", "ફોનમાં એપ ખોલો", p("name" to "s"), "name"))
+                  put(tool("call", "કોલ કરો (નામ કે નંબર)", p("who" to "s"), "who"))
+                  put(tool("send_sms", "SMS મોકલો", p("who" to "s", "text" to "s"), "who", "text"))
+                  put(tool("whatsapp", "WhatsApp ચેટ ખોલો, ટેક્સ્ટ તૈયાર સાથે", p("who" to "s", "text" to "s"), "text"))
+                  put(tool("set_alarm", "એલાર્મ", p("hour" to "int", "minute" to "int", "label" to "s"), "hour"))
+                  put(tool("set_timer", "ટાઈમર સેકન્ડમાં", p("seconds" to "int"), "seconds"))
+                  put(tool("flashlight", "ટોર્ચ ચાલુ/બંધ", p("on" to "bool"), "on"))
+                  put(tool("volume", "વોલ્યુમ: up/down/mute", p("direction" to "s"), "direction"))
+                  put(tool("navigate", "નકશામાં નેવિગેશન", p("place" to "s"), "place"))
+                  put(tool("search_web", "Google સર્ચ", p("query" to "s"), "query"))
+                  put(tool("play_youtube", "YouTube સર્ચ", p("query" to "s"), "query"))
+                  put(tool("read_screen", "અત્યારની સ્ક્રીનનું લખાણ વાંચો"))
+                  put(tool("click_text", "સ્ક્રીન પર આ લખાણવાળું બટન દબાવો", p("text" to "s"), "text"))
+                  put(tool("type_text", "પસંદ કરેલા ટેક્સ્ટ બોક્સમાં લખો", p("text" to "s"), "text"))
+                  put(tool("system_button", "back/home/recents/notifications/scroll_down/scroll_up", p("which" to "s"), "which"))
+              }
+
+              fun ask(ctx: Context, text: String): String {
+                  val key = Prefs.key(ctx)
+                  if (key.isBlank()) return "પહેલા એપમાં API કી સેવ કરો."
+                  val msgs = JSONArray(history.toString())
+                  msgs.put(JSONObject().put("role", "user").put("content", text))
+                  var reply = ""
+                  for (round in 0 until 8) {
+                      val body = JSONObject().put("model", MODEL).put("max_tokens", 1024)
+                          .put("system", SYSTEM).put("tools", tools).put("messages", msgs)
+                      val resp = post(key, body) ?: return "નેટવર્ક કે API કીમાં સમસ્યા છે."
+                      val content = resp.optJSONArray("content") ?: return "જવાબ મળ્યો નથી."
+                      msgs.put(JSONObject().put("role", "assistant").put("content", content))
+                      val results = JSONArray()
+                      val sb = StringBuilder()
+                      for (i in 0 until content.length()) {
+                          val c = content.getJSONObject(i)
+                          when (c.getString("type")) {
+                              "text" -> sb.append(c.getString("text"))
+                              "tool_use" -> {
+                                  val out = try { Actions.run(ctx, c.getString("name"), c.getJSONObject("input")) }
+                                            catch (e: Exception) { "ભૂલ: ${e.message}" }
+                                  results.put(JSONObject().put("type", "tool_result")
+                                      .put("tool_use_id", c.getString("id")).put("content", out))
+                              }
+                          }
+                      }
+                      reply = sb.toString()
+                      if (results.length() == 0) break
+                      msgs.put(JSONObject().put("role", "user").put("content", results))
+                  }
+                  history.put(JSONObject().put("role", "user").put("content", text))
+                  history.put(JSONObject().put("role", "assistant").put("content", reply.ifBlank { "થઈ ગયું" }))
+                  while (history.length() > 16) history.remove(0)
+                  return reply
+              }
+
+              private fun post(key: String, body: JSONObject): JSONObject? = try {
+                  val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"; c.doOutput = true
+                  c.connectTimeout = 15000; c.readTimeout = 60000
+                  c.setRequestProperty("content-type", "application/json")
+                  c.setRequestProperty("x-api-key", key)
+                  c.setRequestProperty("anthropic-version", "2023-06-01")
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+                  val ok = c.responseCode in 200..299
+                  val txt = (if (ok) c.inputStream else c.errorStream).bufferedReader().readText()
+                  if (ok) JSONObject(txt) else null
+              } catch (e: Exception) { null }
+          }
+          SHAKTI_EOF
+          mkdir -p shakti/app/src/main/java/com/shakti/assistant
+          cat > shakti/app/src/main/java/com/shakti/assistant/MainActivity.kt <<'SHAKTI_EOF'
+          package com.shakti.assistant
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+                  fun btn(t: String, f: () -> Unit) {
+                      root.addView(Button(this).apply { text = t; setOnClickListener { f() } })
+                  }
+                  root.addView(TextView(this).apply { text = "⚡ શક્તિ"; textSize = 28f })
+                  val key = EditText(this).apply {
+                      hint = "Anthropic API કી (sk-ant-...)"
+                      setText(Prefs.key(this@MainActivity))
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  }
+                  root.addView(key)
+                  btn("API કી સેવ કરો") {
+                      Prefs.save(this, key.text.toString().trim())
+                      Toast.makeText(this, "સેવ થઈ ગયું", Toast.LENGTH_SHORT).show()
+                  }
+                  btn("1. પરવાનગીઓ આપો") {
+                      requestPermissions(arrayOf(
+                          Manifest.permission.RECORD_AUDIO, Manifest.permission.CALL_PHONE,
+                          Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS,
+                          Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  btn("2. બીજી એપ ઉપર દેખાવાની પરવાનગી") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  }
+                  btn("3. Accessibility ચાલુ કરો (શક્તિ)") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  btn("4. બેટરી પ્રતિબંધ દૂર કરો") {
+                      startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                  }
+                  btn("▶ શક્તિ શરૂ કરો") {
+                      Prefs.save(this, key.text.toString().trim())
+                      startForegroundService(Intent(this, ShaktiService::class.java))
+                  }
+                  btn("⏹ શક્તિ બંધ કરો") { stopService(Intent(this, ShaktiService::class.java)) }
+                  root.addView(TextView(this).apply {
+                      text = "શરૂ કર્યા પછી બોલો: “શક્તિ, રમેશને કોલ કરો”"
+                      setPadding(0, pad, 0, 0)
+                  })
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+          }
+          SHAKTI_EOF
+          mkdir -p shakti/app/src/main/java/com/shakti/assistant
+          cat > shakti/app/src/main/java/com/shakti/assistant/Prefs.kt <<'SHAKTI_EOF'
+          package com.shakti.assistant
+
+          import android.content.Context
+
+          object Prefs {
+              private fun sp(c: Context) = c.getSharedPreferences("shakti", Context.MODE_PRIVATE)
+              fun key(c: Context): String = sp(c).getString("key", "") ?: ""
+              fun save(c: Context, k: String) { sp(c).edit().putString("key", k).apply() }
+          }
+          SHAKTI_EOF
+          mkdir -p shakti/app/src/main/java/com/shakti/assistant
+          cat > shakti/app/src/main/java/com/shakti/assistant/ShaktiAccess.kt <<'SHAKTI_EOF'
+          package com.shakti.assistant
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.os.Bundle
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class ShaktiAccess : AccessibilityService() {
+              companion object { var inst: ShaktiAccess? = null }
+
+              override fun onServiceConnected() { inst = this }
+              override fun onUnbind(intent: Intent?): Boolean { inst = null; return super.onUnbind(intent) }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              fun readScreen(): String {
+                  val sb = StringBuilder()
+                  fun walk(n: AccessibilityNodeInfo?) {
+                      if (n == null || sb.length > 3000) return
+                      val t = n.text ?: n.contentDescription
+                      if (t != null) sb.append(t).append(if (n.isClickable) " [click]" else "").append('\n')
+                      for (i in 0 until n.childCount) walk(n.getChild(i))
+                  }
+                  walk(rootInActiveWindow)
+                  return sb.toString().ifBlank { "સ્ક્રીન પર કશું વાંચી શકાયું નહીં" }
+              }
+
+              fun clickText(t: String): String {
+                  val root = rootInActiveWindow ?: return "સ્ક્રીન મળી નથી"
+                  for (n in root.findAccessibilityNodeInfosByText(t)) {
+                      var p: AccessibilityNodeInfo? = n
+                      while (p != null) {
+                          if (p.isClickable && p.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return "ક્લિક કર્યું"
+                          p = p.parent
+                      }
+                  }
+                  return "'$t' સ્ક્રીન પર મળ્યું નથી"
+              }
+
+              fun typeText(t: String): String {
+                  val n = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return "કોઈ ટેક્સ્ટ બોક્સ પસંદ નથી"
+                  val b = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, t) }
+                  return if (n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b)) "લખ્યું" else "લખી શકાયું નહીં"
+              }
+
+              private fun scroll(forward: Boolean): String {
+                  fun find(n: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+                      if (n == null) return null
+                      if (n.isScrollable) return n
+                      for (i in 0 until n.childCount) find(n.getChild(i))?.let { return it }
+                      return null
+                  }
+                  val s = find(rootInActiveWindow) ?: return "સ્ક્રોલ થઈ શકે એવું કશું નથી"
+                  s.performAction(if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
+                  return "સ્ક્રોલ કર્યું"
+              }
+
+              fun press(w: String): String {
+                  val ok = when (w) {
+                      "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
+                      "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
+                      "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
+                      "notifications" -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+                      "scroll_down" -> return scroll(true)
+                      "scroll_up" -> return scroll(false)
+                      else -> false
+                  }
+                  return if (ok) "થઈ ગયું" else "શક્ય નથી"
+              }
+          }
+          SHAKTI_EOF
+          mkdir -p shakti/app/src/main/java/com/shakti/assistant
+          cat > shakti/app/src/main/java/com/shakti/assistant/ShaktiService.kt <<'SHAKTI_EOF'
+          package com.shakti.assistant
+
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.*
+          import android.speech.*
+          import android.speech.tts.*
+          import java.util.Locale
+
+          class ShaktiService : Service(), TextToSpeech.OnInitListener {
+              private val main = Handler(Looper.getMainLooper())
+              private var sr: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private var busy = false
+              private var awaiting = false
+              private var running = true
+              private val wake = Regex("શક્તિ|શક્તી|શકતિ|શક્તિ|shakti|shakthi", RegexOption.IGNORE_CASE)
+
+              override fun onBind(i: Intent?): IBinder? = null
+              override fun onStartCommand(i: Intent?, f: Int, s: Int) = START_STICKY
+
+              override fun onCreate() {
+                  super.onCreate()
+                  getSystemService(NotificationManager::class.java)
+                      .createNotificationChannel(NotificationChannel("shakti", "શક્તિ", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "shakti")
+                      .setContentTitle("શક્તિ સાંભળી રહી છે")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now).build()
+                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  tts = TextToSpeech(this, this)
+              }
+
+              override fun onInit(status: Int) {
+                  tts?.language = Locale("gu", "IN")
+                  tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(id: String?) {}
+                      override fun onDone(id: String?) { resume() }
+                      @Deprecated("x") override fun onError(id: String?) { resume() }
+                  })
+                  listen()
+              }
+
+              private fun resume() = main.post { busy = false; listen() }
+
+              private fun listen() {
+                  if (!running || busy) return
+                  sr?.destroy()
+                  val r = SpeechRecognizer.createSpeechRecognizer(this)
+                  sr = r
+                  r.setRecognitionListener(object : RecognitionListener {
+                      override fun onResults(b: Bundle?) {
+                          handle(b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: "")
+                      }
+                      override fun onError(e: Int) { main.postDelayed({ listen() }, 700) }
+                      override fun onReadyForSpeech(p: Bundle?) {}
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(v: Float) {}
+                      override fun onBufferReceived(b: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onPartialResults(b: Bundle?) {}
+                      override fun onEvent(t: Int, p: Bundle?) {}
+                  })
+                  r.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "gu-IN"))
+              }
+
+              private fun handle(raw: String) {
+                  val t = raw.trim()
+                  val hasWake = wake.containsMatchIn(t)
+                  val cmd = t.replace(wake, "").trim(' ', ',', '.')
+                  when {
+                      t.isEmpty() -> listen()
+                      hasWake && cmd.isNotEmpty() -> run(cmd)
+                      hasWake -> { awaiting = true; say("હા, બોલો") }
+                      awaiting -> { awaiting = false; run(t) }
+                      else -> listen()
+                  }
+              }
+
+              private fun run(cmd: String) {
+                  busy = true
+                  Thread {
+                      val reply = Brain.ask(this, cmd)
+                      main.post { say(reply) }
+                  }.start()
+              }
+
+              private fun say(text: String) {
+                  busy = true
+                  if (text.isBlank()) { resume(); return }
+                  tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u")
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  sr?.destroy(); tts?.shutdown()
+                  super.onDestroy()
+              }
+          }
+          SHAKTI_EOF
+          mkdir -p shakti/app/src/main/res/values
+          cat > shakti/app/src/main/res/values/strings.xml <<'SHAKTI_EOF'
+          <resources>
+              <string name="app_name">શક્તિ</string>
+              <string name="acc_desc">શક્તિને સ્ક્રીન વાંચવા અને ટેપ કરવા દે છે, જેથી તે તમારા બોલેલા કામ એપમાં કરી શકે.</string>
+          </resources>
+          SHAKTI_EOF
+          mkdir -p shakti/app/src/main/res/xml
+          cat > shakti/app/src/main/res/xml/accessibility_config.xml <<'SHAKTI_EOF'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/acc_desc"
+              android:notificationTimeout="100" />
+          SHAKTI_EOF
+          mkdir -p shakti
+          cat > shakti/build.gradle.kts <<'SHAKTI_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          SHAKTI_EOF
+          mkdir -p shakti
+          cat > shakti/gradle.properties <<'SHAKTI_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.nonTransitiveRClass=true
+          SHAKTI_EOF
+          mkdir -p shakti/gradle/wrapper
+          cat > shakti/gradle/wrapper/gradle-wrapper.properties <<'SHAKTI_EOF'
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          SHAKTI_EOF
+          mkdir -p shakti
+          cat > shakti/settings.gradle.kts <<'SHAKTI_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Shakti"
+          include(":app")
+          SHAKTI_EOF
       - name: Build
         run: |
-          D=$(dirname "$(find . -name settings.gradle.kts | head -1)")
-          echo "Project dir: $D"
-          cd "$D"
+          cd shakti
           gradle assembleDebug
       - uses: actions/upload-artifact@v4
         with:
           name: Shakti-APK
-          path: "**/app-debug.apk"
+          path: shakti/app/build/outputs/apk/debug/app-debug.apk
