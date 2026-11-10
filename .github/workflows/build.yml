@@ -189,7 +189,7 @@ jobs:
               private const val MODEL = "claude-sonnet-5-5"
               private val history = JSONArray()
 
-              private const val SYSTEM = "તમારું નામ શક્તિ છે, તમે વપરાશકર્તાના Android ફોનનો વોઇસ આસિસ્ટન્ટ છો. " +
+              const val SYSTEM = "તમારું નામ શક્તિ છે, તમે વપરાશકર્તાના Android ફોનનો વોઇસ આસિસ્ટન્ટ છો. " +
                   "વપરાશકર્તા ગુજરાતીમાં બોલે છે; જવાબ ખૂબ ટૂંકા (1-2 વાક્ય) ગુજરાતીમાં આપો, કારણ કે તે બોલીને સંભળાવાશે. " +
                   "ફોન પર કામ કરવા ટૂલ્સ વાપરો. એપની અંદરનું કામ કરવા: open_app, પછી read_screen થી જુઓ, પછી click_text/type_text/system_button. " +
                   "એપના નામ અંગ્રેજીમાં આપો. સંપર્કનું નામ જેમ બોલાયું તેમ (ગુજરાતી/અંગ્રેજી) આપો. " +
@@ -202,7 +202,7 @@ jobs:
                   JSONObject().put("name", n).put("description", d).put("input_schema",
                       JSONObject().put("type", "object").put("properties", props).put("required", JSONArray(req.toList())))
 
-              private val tools = JSONArray().apply {
+              val tools = JSONArray().apply {
                   put(tool("open_app", "ફોનમાં એપ ખોલો", p("name" to "s"), "name"))
                   put(tool("call", "કોલ કરો (નામ કે નંબર)", p("who" to "s"), "who"))
                   put(tool("send_sms", "SMS મોકલો", p("who" to "s", "text" to "s"), "who", "text"))
@@ -223,6 +223,7 @@ jobs:
               fun ask(ctx: Context, text: String): String {
                   val key = Prefs.key(ctx)
                   if (key.isBlank()) return "પહેલા એપમાં API કી સેવ કરો."
+                  if (!key.startsWith("sk-ant")) return Gemini.ask(ctx, key, text)
                   val msgs = JSONArray(history.toString())
                   msgs.put(JSONObject().put("role", "user").put("content", text))
                   var reply = ""
@@ -271,6 +272,95 @@ jobs:
           }
           SHAKTI_EOF
           mkdir -p shakti/app/src/main/java/com/shakti/assistant
+          cat > shakti/app/src/main/java/com/shakti/assistant/Gemini.kt <<'SHAKTI_EOF'
+          package com.shakti.assistant
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object Gemini {
+              private const val MODEL = "gemini-2.5-flash"
+              private val history = JSONArray()
+
+              private fun msg(role: String, text: String) = JSONObject().put("role", role)
+                  .put("parts", JSONArray().put(JSONObject().put("text", text)))
+
+              private val decls: JSONArray by lazy {
+                  JSONArray().apply {
+                      for (i in 0 until Brain.tools.length()) {
+                          val t = Brain.tools.getJSONObject(i)
+                          val s = t.getJSONObject("input_schema")
+                          val props = s.getJSONObject("properties")
+                          val d = JSONObject().put("name", t.getString("name")).put("description", t.getString("description"))
+                          if (props.length() > 0) {
+                              val np = JSONObject()
+                              for (k in props.keys())
+                                  np.put(k, JSONObject().put("type", props.getJSONObject(k).getString("type").uppercase()))
+                              d.put("parameters", JSONObject().put("type", "OBJECT").put("properties", np)
+                                  .put("required", s.getJSONArray("required")))
+                          }
+                          put(d)
+                      }
+                  }
+              }
+
+              fun ask(ctx: Context, key: String, text: String): String {
+                  val msgs = JSONArray(history.toString())
+                  msgs.put(msg("user", text))
+                  var reply = ""
+                  for (round in 0 until 8) {
+                      val body = JSONObject()
+                          .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", Brain.SYSTEM))))
+                          .put("tools", JSONArray().put(JSONObject().put("functionDeclarations", decls)))
+                          .put("contents", msgs)
+                      val resp = post(key, body) ?: return "નેટવર્ક કે API કીમાં સમસ્યા છે."
+                      val cand = resp.optJSONArray("candidates")?.optJSONObject(0)?.optJSONObject("content")
+                          ?: return "જવાબ મળ્યો નથી."
+                      val parts = cand.optJSONArray("parts") ?: return "જવાબ મળ્યો નથી."
+                      if (!cand.has("role")) cand.put("role", "model")
+                      msgs.put(cand)
+                      val results = JSONArray()
+                      val sb = StringBuilder()
+                      for (i in 0 until parts.length()) {
+                          val p = parts.getJSONObject(i)
+                          if (p.has("text") && !p.optBoolean("thought")) sb.append(p.getString("text"))
+                          val fc = p.optJSONObject("functionCall")
+                          if (fc != null) {
+                              val name = fc.getString("name")
+                              val out = try { Actions.run(ctx, name, fc.optJSONObject("args") ?: JSONObject()) }
+                                        catch (e: Exception) { "ભૂલ: ${e.message}" }
+                              results.put(JSONObject().put("functionResponse",
+                                  JSONObject().put("name", name).put("response", JSONObject().put("result", out))))
+                          }
+                      }
+                      reply = sb.toString()
+                      if (results.length() == 0) break
+                      msgs.put(JSONObject().put("role", "user").put("parts", results))
+                  }
+                  history.put(msg("user", text))
+                  history.put(msg("model", reply.ifBlank { "થઈ ગયું" }))
+                  while (history.length() > 16) history.remove(0)
+                  return reply
+              }
+
+              private fun post(key: String, body: JSONObject): JSONObject? = try {
+                  val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent")
+                      .openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"; c.doOutput = true
+                  c.connectTimeout = 15000; c.readTimeout = 60000
+                  c.setRequestProperty("content-type", "application/json")
+                  c.setRequestProperty("x-goog-api-key", key)
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+                  val ok = c.responseCode in 200..299
+                  val txt = (if (ok) c.inputStream else c.errorStream).bufferedReader().readText()
+                  if (ok) JSONObject(txt) else null
+              } catch (e: Exception) { null }
+          }
+          SHAKTI_EOF
+          mkdir -p shakti/app/src/main/java/com/shakti/assistant
           cat > shakti/app/src/main/java/com/shakti/assistant/MainActivity.kt <<'SHAKTI_EOF'
           package com.shakti.assistant
 
@@ -296,7 +386,7 @@ jobs:
                   }
                   root.addView(TextView(this).apply { text = "⚡ શક્તિ"; textSize = 28f })
                   val key = EditText(this).apply {
-                      hint = "Anthropic API કી (sk-ant-...)"
+                      hint = "API કી (Gemini: AIza... / Claude: sk-ant-...)"
                       setText(Prefs.key(this@MainActivity))
                       inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                   }
