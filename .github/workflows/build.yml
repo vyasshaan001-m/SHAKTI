@@ -282,7 +282,8 @@ jobs:
           import java.net.URL
 
           object Gemini {
-              private const val MODEL = "gemini-2.5-flash"
+              private val MODELS = listOf("gemini-2.5-flash", "gemini-flash-latest")
+              private var lastError = ""
               private val history = JSONArray()
 
               private fun msg(role: String, text: String) = JSONObject().put("role", role)
@@ -316,7 +317,7 @@ jobs:
                           .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", Brain.SYSTEM))))
                           .put("tools", JSONArray().put(JSONObject().put("functionDeclarations", decls)))
                           .put("contents", msgs)
-                      val resp = post(key, body) ?: return "નેટવર્ક કે API કીમાં સમસ્યા છે."
+                      val resp = post(key, body) ?: return "Gemini ભૂલ: $lastError"
                       val cand = resp.optJSONArray("candidates")?.optJSONObject(0)?.optJSONObject("content")
                           ?: return "જવાબ મળ્યો નથી."
                       val parts = cand.optJSONArray("parts") ?: return "જવાબ મળ્યો નથી."
@@ -346,18 +347,28 @@ jobs:
                   return reply
               }
 
-              private fun post(key: String, body: JSONObject): JSONObject? = try {
-                  val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent")
-                      .openConnection() as HttpURLConnection
-                  c.requestMethod = "POST"; c.doOutput = true
-                  c.connectTimeout = 15000; c.readTimeout = 60000
-                  c.setRequestProperty("content-type", "application/json")
-                  c.setRequestProperty("x-goog-api-key", key)
-                  c.outputStream.use { it.write(body.toString().toByteArray()) }
-                  val ok = c.responseCode in 200..299
-                  val txt = (if (ok) c.inputStream else c.errorStream).bufferedReader().readText()
-                  if (ok) JSONObject(txt) else null
-              } catch (e: Exception) { null }
+              private fun post(key: String, body: JSONObject): JSONObject? {
+                  for (m in MODELS) {
+                      try {
+                          val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$m:generateContent")
+                              .openConnection() as HttpURLConnection
+                          c.requestMethod = "POST"; c.doOutput = true
+                          c.connectTimeout = 15000; c.readTimeout = 60000
+                          c.setRequestProperty("content-type", "application/json")
+                          c.setRequestProperty("x-goog-api-key", key.trim())
+                          c.outputStream.use { it.write(body.toString().toByteArray()) }
+                          val code = c.responseCode
+                          val txt = (if (code in 200..299) c.inputStream else c.errorStream).bufferedReader().readText()
+                          if (code in 200..299) return JSONObject(txt)
+                          lastError = "$m HTTP $code " + txt.replace("\n", " ").take(160)
+                          if (code != 404) return null
+                      } catch (e: Exception) {
+                          lastError = e.javaClass.simpleName + " " + (e.message ?: "")
+                          return null
+                      }
+                  }
+                  return null
+              }
           }
           SHAKTI_EOF
           mkdir -p shakti/app/src/main/java/com/shakti/assistant
